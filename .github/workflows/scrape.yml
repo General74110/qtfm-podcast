@@ -1,19 +1,16 @@
-name: 🎧 蜻蜓播客爬虫
+name: qtfm-podcast
 on:
-  # 手动触发
   workflow_dispatch:
     inputs:
       channel_id:
-        description: '蜻蜓频道ID (如 427910)'
+        description: '蜻蜓频道ID'
         required: true
         type: string
       worker_base:
-        description: 'Worker音频代理地址'
+        description: 'Worker地址'
         required: false
         default: 'https://qtfm-podcast.general74110.workers.dev'
         type: string
-
-  # Telegram Bot 触发
   repository_dispatch:
     types: [scrape]
 
@@ -21,11 +18,9 @@ jobs:
   scrape:
     runs-on: ubuntu-latest
     steps:
-      - name: 📥 检出代码
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: 🔍 解析参数
-        id: params
+      - id: params
         run: |
           if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
             echo "channel_id=${{ github.event.client_payload.channel_id }}" >> $GITHUB_OUTPUT
@@ -34,62 +29,30 @@ jobs:
           else
             echo "channel_id=${{ github.event.inputs.channel_id }}" >> $GITHUB_OUTPUT
             echo "worker_base=${{ github.event.inputs.worker_base || 'https://qtfm-podcast.general74110.workers.dev' }}" >> $GITHUB_OUTPUT
-            echo "title=手动触发" >> $GITHUB_OUTPUT
+            echo "title=manual" >> $GITHUB_OUTPUT
           fi
 
-      - name: 🚀 运行爬虫
-        run: |
-          echo "抓取频道: ${{ steps.params.outputs.channel_id }}"
-          node scripts/scrape.js
+      - name: scrape
+        run: node scripts/scrape.js
         env:
           CHANNEL_ID: ${{ steps.params.outputs.channel_id }}
           WORKER_BASE: ${{ steps.params.outputs.worker_base }}
           OUT_DIR: novels
-          MAX_PROGRAMS: 5000
 
-      - name: 📋 生成频道列表
-        run: |
-          node -e "
-            const fs = require('fs');
-            const dir = 'novels';
-            const files = fs.readdirSync(dir).filter(f => f.endsWith('.json') && f !== 'index.json');
-            let html = '<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>蜻蜓FM播客列表</title>';
-            html += '<style>body{font-family:sans-serif;max-width:800px;margin:auto;padding:2em;line-height:1.6}</style></head><body>';
-            html += '<h1>🎧 蜻蜓FM播客订阅</h1><ul>';
-            const index = files.map(f => JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8')));
-            index.sort((a,b) => new Date(b.generatedAt) - new Date(a.generatedAt));
-            for (const m of index) {
-              html += \`<li><a href=\"/qtfm-podcast/\${m.channelId}.xml\">\${m.title}</a> (\${m.programs}集，\${m.duration})</li>\`;
-            }
-            html += '</ul></body></html>';
-            fs.writeFileSync(path.join(dir, 'index.html'), html);
-          "
-
-      - name: 📤 部署到 GitHub Pages
+      - name: deploy pages
         uses: peaceiris/actions-gh-pages@v3
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: ./novels
           publish_branch: gh-pages
-          keep_files: false
           force_orphan: true
 
-      - name: 📢 推送完成后通知Telegram
-        if: ${{ steps.params.outputs.channel_id != '' }}
+      - name: notify
+        if: ${{ always() && steps.params.outputs.channel_id != '' }}
         env:
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          CHANNEL_ID: ${{ steps.params.outputs.channel_id }}
-          TITLE: ${{ steps.params.outputs.title }}
+          BOT: ${{ secrets.TG_BOT_TOKEN }}
+          CHAT: ${{ secrets.TG_CHAT_ID }}
+          CID: ${{ steps.params.outputs.channel_id }}
         run: |
-          curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
-            -d "chat_id=${TG_CHAT_ID}&parse_mode=HTML&text=✅ <b>抓取完成</b>
-
-        频道: ${TITLE:-${CHANNEL_ID}}
-        ID: ${CHANNEL_ID}
-
-        📖 Apple播客订阅链接:
-        https://general74110.github.io/qtfm-podcast/${CHANNEL_ID}.xml
-
-        🎧 Worker代理（不过期）:
-        https://qtfm-podcast.general74110.workers.dev/${CHANNEL_ID}"
+          curl -s "https://api.telegram.org/bot${BOT}/sendMessage" \
+            -d "chat_id=${CHAT}&text=Done: channel ${CID}"
