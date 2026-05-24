@@ -72,16 +72,57 @@ async function main() {
   console.log('[' + CHANNEL_ID + '] Starting with curl...');
   const startTime = Date.now();
 
-  const html = await httpGet('https://m.qtfm.cn/vchannels/' + CHANNEL_ID + '/');
-  const data = extractInitStores(html);
-  if (!data?.VChannelStore?.channel) throw new Error('Parse failed');
+  let html = await httpGet('https://m.qtfm.cn/vchannels/' + CHANNEL_ID + '/');
+  let data = extractInitStores(html);
 
-  const ch = data.VChannelStore.channel;
-  const ver = ch.v || '';
-  const title = ch.title || 'Unknown';
-  const desc = (ch.description || title).replace(/<[^>]+>/g, '').trim();
-  const cover = ch.cover ? ch.cover + '!400' : '';
-  console.log('Title: ' + title + ', Total: ' + (ch.program_count || 0));
+  // 如果频道SSR数据为空，尝试从SEO或搜索找实际频道
+  let ch, ver, title, desc, cover;
+  if (data?.VChannelStore?.channel?.id) {
+    ch = data.VChannelStore.channel;
+    ver = ch.v || '';
+    title = ch.title || 'Unknown';
+    desc = (ch.description || title).replace(/<[^>]+>/g, '').trim();
+    cover = ch.cover ? ch.cover + '!400' : '';
+    console.log('Title: ' + title + ', Total: ' + (ch.program_count || 0));
+  } else {
+    // SSR空数据：从SEO获取标题
+    const seo = data?.VChannelStore?.seo || [];
+    const seoTitle = seo.find(s => s.elementType === 'title')?.innerText || '';
+    const seoDesc = seo.find(s => s.elementType === 'meta' && s.name === 'description')?.content || '';
+    title = seoTitle.replace(/\s*有声小说在线收听.*$/, '') || 'Channel ' + CHANNEL_ID;
+    desc = seoDesc.slice(0, 200) || title;
+    cover = '';
+    console.log('SSR empty for ' + CHANNEL_ID + ', SEO title: ' + title);
+
+    // 通过搜索找实际内容频道
+    const keyword = encodeURIComponent(title.replace(/\s*\(.*?\)\s*/, '').trim());
+    try {
+      const search = await httpGet('https://webapi.qtfm.cn/api/mobile/search/keyword/' + keyword + '?page=1&pageSize=10', true);
+      const channels = search?.channels?.data || [];
+      // 找节目数最多（最匹配）的频道
+      const best = channels.sort((a,b) => (b.program_count||0) - (a.program_count||0))[0];
+      if (best && best.id && best.program_count > 0) {
+        console.log('Found real channel: ' + best.id + ' (' + best.title + ', ' + best.program_count + ' eps)');
+        // 重新用正确的频道ID获取
+        const realHtml = await httpGet('https://m.qtfm.cn/vchannels/' + best.id + '/');
+        const realData = extractInitStores(realHtml);
+        if (realData?.VChannelStore?.channel?.id) {
+          ch = realData.VChannelStore.channel;
+          ver = ch.v || '';
+          title = ch.title || best.title || title;
+          desc = (ch.description || title).replace(/<[^>]+>/g, '').trim();
+          cover = ch.cover ? ch.cover + '!400' : '';
+          console.log('Using channel ' + best.id + ': ' + title + ', ' + (ch.program_count || 0) + ' eps');
+        } else {
+          throw new Error('Real channel also has empty SSR: ' + best.id);
+        }
+      } else {
+        throw new Error('No content channel found for ' + CHANNEL_ID);
+      }
+    } catch(e) {
+      throw new Error('Cannot find channel content: ' + e.message);
+    }
+  }
 
   let allProgs = [];
   const seenIds = new Set();
