@@ -11,7 +11,24 @@ const OUT_DIR = process.env.OUT_DIR || 'novels';
 
 const UA = 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36';
 
-function httpGet(url, acceptJSON) {
+async function httpGet(url, acceptJSON, retries) {
+  retries = retries || 3;
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      return await httpGetOnce(url, acceptJSON);
+    } catch(e) {
+      if (attempt < retries) {
+        const wait = 2000 * attempt;
+        console.log('  Retry ' + attempt + '/' + retries + ' for ' + url.slice(0,80) + '... wait ' + wait + 'ms');
+        await sleep(wait);
+      } else {
+        throw e;
+      }
+    }
+  }
+}
+
+function httpGetOnce(url, acceptJSON) {
   return new Promise((ok, fail) => {
     const mod = url.startsWith('https') ? https : http;
     const headers = acceptJSON
