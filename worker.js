@@ -34,6 +34,20 @@ async function fetchHTML(url) {
   return r.text();
 }
 
+// ── 从GH Pages获取全量RSS（优先） ──
+async function fetchPagesRSS(env, channelId) {
+  try {
+    const r = await fetch(`${PAGE_BASE}/${channelId}.xml`, { signal: AbortSignal.timeout(10000) });
+    if (!r.ok) return null;
+    const rss = await r.text();
+    // 缓存到KV
+    if (env?.QTFM_CACHE) {
+      await env.QTFM_CACHE.put('rss:' + channelId, rss, { expirationTtl: CACHE_TTL });
+    }
+    return rss;
+  } catch (_) { return null; }
+}
+
 // ── RSS生成（轻量版，给Worker用） ──
 function extractInitStores(html) {
   const m = html.match(/window\.__initStores\s*=\s*(\{)/);
@@ -394,31 +408,70 @@ async function handleNotify(env, body) {
 
 // ── Update channel list from GH Pages (called on schedule) ──
 async function syncFromGHPages(env) {
+  if (!env?.QTFM_CACHE) return;
+
+  // 优先state.json（新格式，含状态），回退index.json（旧格式）
+  let channels = [];
   try {
     const r = await fetch(`${PAGE_BASE}/state.json`, { signal: AbortSignal.timeout(10000) });
-    if (!r.ok) return;
-    const state = await r.json();
-    if (!env?.QTFM_CACHE) return;
-
-    const promises = [];
-    for (const [cid, s] of Object.entries(state)) {
-      if (!cid || !s) continue;
-      const meta = {
-        channelId: cid, title: s.title || '',
-        programs: s.totalPrograms || 0, totalExpected: s.channelTotal || 0,
+    if (r.ok) {
+      const state = await r.json();
+      channels = Object.entries(state).filter(([cid, s]) => cid && s).map(([cid, s]) => ({
+        channelId: cid,
+        title: s.title || '',
+        programs: s.totalPrograms || 0,
+        totalExpected: s.channelTotal || 0,
         isComplete: !!s.isComplete,
         lastEpisodeId: s.lastEpisodeId || '',
         lastEpisodeTitle: s.lastEpisodeTitle || '',
         lastUpdateTime: s.lastUpdateTime || '',
         generatedAt: s.lastCrawledAt || '',
         generatedTime: new Date(s.lastCrawledAt || 0).getTime() || 0,
-        duration: '0s',
-      };
-      promises.push(env.QTFM_CACHE.put('meta:' + cid, JSON.stringify(meta), { expirationTtl: CACHE_TTL }));
-      promises.push(addActiveChannel(env, cid, s.title, s.totalPrograms));
+      }));
     }
-    if (promises.length) await Promise.allSettled(promises);
-  } catch (_) { }
+  } catch (_) {}
+
+  // 回退index.json
+  if (!channels.length) {
+    try {
+      const r = await fetch(`${PAGE_BASE}/index.json`, { signal: AbortSignal.timeout(10000) });
+      if (r.ok) {
+        const list = await r.json();
+        channels = list.filter(c => c.channelId).map(c => ({
+          channelId: c.channelId,
+          title: c.title || '',
+          programs: c.programs || 0,
+          totalExpected: c.totalExpected || c.programs || 0,
+          isComplete: !!c.isComplete,
+          lastEpisodeId: '',
+          lastEpisodeTitle: '',
+          lastUpdateTime: c.generatedAt || '',
+          generatedAt: c.generatedAt || '',
+          generatedTime: new Date(c.generatedAt || 0).getTime() || Date.now(),
+        }));
+      }
+    } catch (_) {}
+  }
+
+  if (!channels.length) return;
+
+  const promises = [];
+  for (const c of channels) {
+    const meta = {
+      channelId: c.channelId, title: c.title,
+      programs: c.programs, totalExpected: c.totalExpected,
+      isComplete: c.isComplete,
+      lastEpisodeId: c.lastEpisodeId,
+      lastEpisodeTitle: c.lastEpisodeTitle,
+      lastUpdateTime: c.lastUpdateTime,
+      generatedAt: c.generatedAt,
+      generatedTime: c.generatedTime,
+      duration: '0s',
+    };
+    promises.push(env.QTFM_CACHE.put('meta:' + c.channelId, JSON.stringify(meta), { expirationTtl: CACHE_TTL }));
+    promises.push(addActiveChannel(env, c.channelId, c.title, c.programs));
+  }
+  if (promises.length) await Promise.allSettled(promises);
 }
 
 // ── Request Handler ──
@@ -498,23 +551,31 @@ export default {
     if (!channelId || !/^\d+$/.test(channelId))
       return textResp(`用法: ${base}/频道ID`);
 
-    // 读缓存
-    if (env?.QTFM_CACHE) {
-      const cached = await env.QTFM_CACHE.get('rss:' + channelId, { type: 'text' }).catch(() => null);
-      if (cached) {
-        // 后台刷新（不阻塞响应）
-        const meta = await env.QTFM_CACHE.get('meta:' + channelId, { type: 'text' }).catch(() => null);
-        if (meta) {
-          const m = JSON.parse(meta);
+    // 🌟 优先：从GH Pages取全量RSS（Action爬的）
+    const pagesRSS = await fetchPagesRSS(env, channelId);
+    if (pagesRSS) {
+      // 后台更新meta
+      if (env?.QTFM_CACHE) {
+        const rawMeta = await env.QTFM_CACHE.get('meta:' + channelId, { type: 'text' }).catch(() => null);
+        if (rawMeta) {
+          const m = JSON.parse(rawMeta);
           if (!m.isComplete && Date.now() - (m.generatedTime || 0) > REFRESH_THRESHOLD * 0.5) {
             ctx.waitUntil(genRSS(env, channelId, base));
           }
         }
+      }
+      return rssResp(pagesRSS);
+    }
+
+    // 回退：KV缓存
+    if (env?.QTFM_CACHE) {
+      const cached = await env.QTFM_CACHE.get('rss:' + channelId, { type: 'text' }).catch(() => null);
+      if (cached) {
         return rssResp(cached);
       }
     }
 
-    // 生成
+    // 最后回退：自己生成（只有30集，但聊胜于无）
     try {
       const rss = await genRSS(env, channelId, base);
       if (rss) return rssResp(rss);
