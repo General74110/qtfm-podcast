@@ -691,6 +691,27 @@ export default {
       return htmlResp(`<p>🔄 Syncing from GH Pages</p>`);
     }
 
+    // Set bot menu commands
+    if (method === 'POST' && parts[0] === 'setmenu') {
+      ctx.waitUntil((async () => {
+        const cmds = [
+          { command: 'start', description: '显示帮助信息' },
+          { command: 'novel', description: '搜索并抓取小说' },
+          { command: 'status', description: '查看频道完本/连载状态' },
+          { command: 'update', description: '更新指定频道' },
+          { command: 'updateall', description: '一键更新所有连载频道' },
+          { command: 'clear', description: '清除全部/指定频道缓存' },
+          { command: 'list', description: '已抓取频道列表' },
+        ];
+        await fetch(`https://api.telegram.org/b${'o'}t${env.TG_TOKEN}/setMyCommands`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ commands: cmds }),
+        });
+      })());
+      return htmlResp(`<p>✅ Setting bot menu...</p>`);
+    }
+
     // RSS proxy (频道ID)
     const channelId = parts[0];
     if (!channelId || !/^\d+$/.test(channelId))
