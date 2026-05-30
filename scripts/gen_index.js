@@ -13,6 +13,9 @@ h1{font-weight:700;font-size:2em;margin-bottom:.5em}
 .card .links{margin-top:.8em;display:flex;gap:1em;flex-wrap:wrap}
 .card .links a{padding:.4em 1em;border-radius:8px;background:#007aff;color:#fff;text-decoration:none;font-size:.85em;display:inline-block}
 .card .links a.alt{background:#34c759}
+.status-badge{display:inline-block;font-size:.75em;padding:.15em .5em;border-radius:4px;margin-left:.5em}
+.status-complete{background:#34c759;color:#fff}
+.status-ongoing{background:#ff9500;color:#fff}
 .empty{color:#86868b;text-align:center;padding:3em}
 </style>
 </head>
@@ -26,14 +29,16 @@ fetch('index.json').then(r=>r.json()).then(data=>{
   if(!data||data.length===0){list.innerHTML='<div class="empty">📭 暂无频道</div>';return}
   data.sort((a,b)=>new Date(b.generatedAt)-new Date(a.generatedAt));
   list.innerHTML=data.map(c=>{
-    const rssUrl=\`\${c.channelId}.xml\`;
-    const proxyUrl=\`https://qtfm-podcast.general74110.workers.dev/\${c.channelId}\`;
-    return \`<div class="card"><h2><a href="\${rssUrl}">\${c.title}</a></h2>
-    <div class="meta">\${c.programs||0}集 · \${new Date(c.generatedAt).toLocaleDateString('zh-CN')}</div>
-    <div class="links">
-      <a href="\${rssUrl}">📖 RSS</a>
-      <a class="alt" href="\${proxyUrl}">🎧 Worker</a>
-    </div></div>\`;
+    const rssUrl=c.channelId+'.xml';
+    const proxyUrl='https://qtfm-podcast.general74110.workers.dev/'+c.channelId;
+    const statusClass=c.isComplete?'status-complete':'status-ongoing';
+    const statusText=c.isComplete?'✅ 完本':'🔄 连载';
+    return '<div class="card"><h2><a href="'+rssUrl+'">'+c.title+'</a><span class="status-badge '+statusClass+'">'+statusText+'</span></h2>'+
+    '<div class="meta">'+c.programs+'集 · '+new Date(c.generatedAt).toLocaleDateString('zh-CN')+'</div>'+
+    '<div class="links">'+
+      '<a href="'+rssUrl+'">📖 RSS</a>'+
+      '<a class="alt" href="'+proxyUrl+'">🎧 Worker</a>'+
+    '</div></div>';
   }).join('');
 }).catch(()=>{
   document.getElementById('list').innerHTML='<div class="empty">❌ 加载失败</div>';

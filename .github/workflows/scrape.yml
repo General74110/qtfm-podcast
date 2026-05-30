@@ -11,8 +11,17 @@ on:
         required: false
         default: 'https://qtfm-podcast.general74110.workers.dev'
         type: string
+      action_type:
+        description: 'initial | update'
+        required: false
+        default: 'initial'
+        type: string
   repository_dispatch:
     types: [scrape]
+
+concurrency:
+  group: scrape-${{ github.event.client_payload.channel_id || github.event.inputs.channel_id }}
+  cancel-in-progress: true
 
 jobs:
   scrape:
@@ -23,14 +32,20 @@ jobs:
       - id: params
         run: |
           if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
-            echo "channel_id=${{ github.event.client_payload.channel_id }}" >> $GITHUB_OUTPUT
-            echo "worker_base=${{ github.event.client_payload.worker_base || 'https://qtfm-podcast.general74110.workers.dev' }}" >> $GITHUB_OUTPUT
-            echo "title=${{ github.event.client_payload.title }}" >> $GITHUB_OUTPUT
+            CID="${{ github.event.client_payload.channel_id }}"
+            WB="${{ github.event.client_payload.worker_base || 'https://qtfm-podcast.general74110.workers.dev' }}"
+            TITLE="${{ github.event.client_payload.title }}"
+            AT="${{ github.event.client_payload.action_type || 'initial' }}"
           else
-            echo "channel_id=${{ github.event.inputs.channel_id }}" >> $GITHUB_OUTPUT
-            echo "worker_base=${{ github.event.inputs.worker_base || 'https://qtfm-podcast.general74110.workers.dev' }}" >> $GITHUB_OUTPUT
-            echo "title=manual" >> $GITHUB_OUTPUT
+            CID="${{ github.event.inputs.channel_id }}"
+            WB="${{ github.event.inputs.worker_base || 'https://qtfm-podcast.general74110.workers.dev' }}"
+            TITLE="${{ github.event.inputs.title || 'manual' }}"
+            AT="${{ github.event.inputs.action_type || 'initial' }}"
           fi
+          echo "channel_id=${CID}" >> $GITHUB_OUTPUT
+          echo "worker_base=${WB}" >> $GITHUB_OUTPUT
+          echo "title=${TITLE}" >> $GITHUB_OUTPUT
+          echo "action_type=${AT}" >> $GITHUB_OUTPUT
 
       - name: scrape
         run: node scripts/scrape.js
@@ -38,6 +53,7 @@ jobs:
           CHANNEL_ID: ${{ steps.params.outputs.channel_id }}
           WORKER_BASE: ${{ steps.params.outputs.worker_base }}
           OUT_DIR: novels
+          NODE_OPTIONS: --max-old-space-size=1024
 
       - name: deploy pages
         uses: peaceiris/actions-gh-pages@v4
@@ -49,7 +65,20 @@ jobs:
         env:
           ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
 
-      - name: notify
+      - name: notify worker
+        if: ${{ success() && steps.params.outputs.channel_id != '' }}
+        env:
+          CID: ${{ steps.params.outputs.channel_id }}
+          TITLE: ${{ steps.params.outputs.title }}
+          WB: ${{ steps.params.outputs.worker_base }}
+        run: |
+          # 读取scrape输出的元数据，通知Worker
+          META=$(cat novels/${CID}.json 2>/dev/null || echo '{}')
+          curl -s -X POST "${WB}/notify" \
+            -H "Content-Type: application/json" \
+            -d "${META}" || true
+
+      - name: notify telegram
         if: ${{ success() && steps.params.outputs.channel_id != '' }}
         env:
           BOT: ${{ secrets.TG_BOT_TOKEN }}
@@ -57,7 +86,11 @@ jobs:
           CID: ${{ steps.params.outputs.channel_id }}
           TITLE: ${{ steps.params.outputs.title }}
         run: |
+          IS_COMPLETE=$(cat novels/${CID}.json 2>/dev/null | grep -o '"isComplete":true' || echo "false")
+          COUNT=$(cat novels/${CID}.json 2>/dev/null | grep -o '"programs":[0-9]*' | grep -o '[0-9]*' || echo "0")
+          STATUS_ICON=$([ "$IS_COMPLETE" = '"isComplete":true' ] && echo "✅" || echo "🔄")
+          STATUS_TEXT=$([ "$IS_COMPLETE" = '"isComplete":true' ] && echo "完本" || echo "连载中")
           curl -s "https://api.telegram.org/bot${BOT}/sendMessage" \
             -d "chat_id=${CHAT}" \
             -d "parse_mode=HTML" \
-            -d "text=✅ <b>抓取完成</b>%0A频道: ${TITLE:-${CID}}%0AID: ${CID}%0A📖 RSS: https://general74110.github.io/qtfm-podcast/${CID}.xml%0A🎧 Worker: https://qtfm-podcast.general74110.workers.dev/${CID}"
+            -d "text=${STATUS_ICON} <b>${TITLE:-${CID}}</b>%0AID: ${CID}%0A集数: ${COUNT}%0A状态: ${STATUS_TEXT}%0A📖 RSS: https://general74110.github.io/qtfm-podcast/${CID}.xml%0A🎧 Worker: https://qtfm-podcast.general74110.workers.dev/${CID}"

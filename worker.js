@@ -1,26 +1,40 @@
-// Qtfm Podcast Worker - v1.1
-// Secrets (TG_TOKEN, GH_TOKEN, GH_REPO) are set via CF Dashboard env vars
-const CACHE_TTL = 21600;
+// Qtfm Podcast Worker v2 — 状态管理 + 完本/连载逻辑
+// Secrets: TG_TOKEN, GH_TOKEN, GH_REPO 在CF面板设置
+// KV: QTFM_CACHE namespace
+
+const CACHE_TTL = 21600; // 6h
+const REFRESH_THRESHOLD = 21600 * 1000; // 6h
 const UA = 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36';
 
+const PAGE_BASE = 'https://general74110.github.io/qtfm-podcast';
+
+// ── Telegram ──
 function tgSend(chatId, text, parseMode, env) {
   const p = new URLSearchParams({ chat_id: chatId, text });
   if (parseMode) p.set('parse_mode', parseMode);
   return fetch(`https://api.telegram.org/bot${env.TG_TOKEN}/sendMessage?${p}`);
 }
-function tgSendHTML(chatId, text, env) { return tgSend(chatId, text, 'HTML', env).catch(() => tgSend(chatId, text, null, env)); }
-
-async function fetchPage(url) {
-  const r = await fetch(url, { headers: { 'User-Agent': UA, 'Accept': 'text/html', 'Referer': 'https://m.qtfm.cn/' } });
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return r.text();
+function tgSendHTML(chatId, text, env) {
+  return tgSend(chatId, text, 'HTML', env).catch(() => tgSend(chatId, text, null, env));
 }
+
+// ── HTTP ──
 async function fetchJSON(url) {
-  const r = await fetch(url, { headers: { 'User-Agent': UA, 'Accept':'application/json', 'Origin':'https://m.qtfm.cn', 'Referer':'https://m.qtfm.cn/' } });
+  const r = await fetch(url, {
+    headers: { 'User-Agent': UA, Accept: 'application/json', Origin: 'https://m.qtfm.cn', Referer: 'https://m.qtfm.cn/' },
+  });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   return r.json();
 }
+async function fetchHTML(url) {
+  const r = await fetch(url, {
+    headers: { 'User-Agent': UA, Accept: 'text/html', Referer: 'https://m.qtfm.cn/' },
+  });
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  return r.text();
+}
 
+// ── RSS生成（轻量版，给Worker用） ──
 function extractInitStores(html) {
   const m = html.match(/window\.__initStores\s*=\s*(\{)/);
   if (!m) return null;
@@ -37,40 +51,39 @@ function extractInitStores(html) {
   }
   return null;
 }
-function esc(s) { return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
-function fmtDur(s) { const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),s2=s%60; return h>0?`${h}:${String(m).padStart(2,'0')}:${String(s2).padStart(2,'0')}`:`${m}:${String(s2).padStart(2,'0')}`; }
+function esc(s) { return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+function fmtDur(s) { const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), s2 = s % 60; return h > 0 ? `${h}:${String(m).padStart(2, '0')}:${String(s2).padStart(2, '0')}` : `${m}:${String(s2).padStart(2, '0')}`; }
 
-async function refreshChannel(env, channelId, baseUrl) {
+async function genRSS(env, channelId, baseUrl, forCache = true) {
   const startedAt = Date.now();
-  const html = await fetchPage(`https://m.qtfm.cn/vchannels/${channelId}/`);
+  const html = await fetchHTML(`https://m.qtfm.cn/vchannels/${channelId}/`);
   const d = extractInitStores(html);
-  if (!d?.VChannelStore?.channel) throw new Error('Cannot parse');
+  if (!d?.VChannelStore?.channel) throw new Error('Cannot parse channel');
 
   const ch = d.VChannelStore.channel;
   const title = ch.title || '未知';
-  const desc = (ch.description||title).replace(/<[^>]+>/g,'').trim();
+  const desc = (ch.description || title).replace(/<[^>]+>/g, '').trim();
   const cover = ch.cover ? ch.cover + '!400' : '';
+  const totalExpected = ch.program_count || 0;
 
   let programs = [];
-  if (ch.v) try { programs = (await fetchJSON(`https://webapi.qtfm.cn/api/mobile/channels/${channelId}/programs?version=${ch.v}`)).programs || []; } catch(_) {}
+  if (ch.v) try { programs = (await fetchJSON(`https://webapi.qtfm.cn/api/mobile/channels/${channelId}/programs?version=${ch.v}`)).programs || []; } catch (_) { }
   if (!programs.length) programs = d.VChannelStore.programs?.items || [];
 
   const nowUTC = new Date().toUTCString();
-  let items = '';
-  for (const p of programs) {
-    const pid = p.programId;
-    if (!pid) continue;
-    items += `    <item>
+  const items = programs
+    .filter(p => p.programId)
+    .map(p => `    <item>
       <title>${esc(p.title)}</title>
-      <link>https://m.qtfm.cn/vchannels/${channelId}/programs/${pid}/</link>
-      <guid isPermaLink="false">qtfm-${channelId}-${pid}</guid>
+      <link>https://m.qtfm.cn/vchannels/${channelId}/programs/${p.programId}/</link>
+      <guid isPermaLink="false">qtfm-${channelId}-${p.programId}</guid>
       <description>${esc(p.title)}</description>
-      <enclosure url="${baseUrl}/audio/${channelId}/${pid}" length="0" type="audio/mpeg"/>
-      <itunes:duration>${fmtDur(p.duration||0)}</itunes:duration>
+      <enclosure url="${baseUrl}/audio/${channelId}/${p.programId}" length="0" type="audio/mpeg"/>
+      <itunes:duration>${fmtDur(p.duration || 0)}</itunes:duration>
       <itunes:author>蜻蜓FM</itunes:author>
       <pubDate>${p.updateTime ? new Date(p.updateTime).toUTCString() : nowUTC}</pubDate>
-    </item>\n`;
-  }
+    </item>`)
+    .join('\n');
 
   const rss = `<?xml version="1.0" encoding="UTF-8"?>
 <rss xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd" version="2.0">
@@ -85,14 +98,24 @@ async function refreshChannel(env, channelId, baseUrl) {
     <itunes:category text="有声书"/>
     <lastBuildDate>${nowUTC}</lastBuildDate>
     <pubDate>${nowUTC}</pubDate>
-${items}  </channel>
+${items}
+  </channel>
 </rss>`;
 
-  if (env?.QTFM_CACHE) {
-    const meta = { channelId, title, programs: programs.length, generatedAt: nowUTC, generatedTime: Date.now(), duration: `${Math.round((Date.now()-startedAt)/1000)}s` };
+  if (forCache && env?.QTFM_CACHE) {
+    const isComplete = programs.length >= totalExpected;
+    const last = programs[programs.length - 1];
+    const meta = {
+      channelId, title, programs: programs.length, totalExpected, isComplete,
+      lastEpisodeId: last?.programId || '',
+      lastEpisodeTitle: last?.title || '',
+      lastUpdateTime: last?.updateTime || nowUTC,
+      generatedAt: nowUTC, generatedTime: Date.now(),
+      duration: `${Math.round((Date.now() - startedAt) / 1000)}s`,
+    };
     await Promise.all([
-      env.QTFM_CACHE.put('rss:'+channelId, rss, { expirationTtl: CACHE_TTL }),
-      env.QTFM_CACHE.put('meta:'+channelId, JSON.stringify(meta), { expirationTtl: CACHE_TTL }),
+      env.QTFM_CACHE.put('rss:' + channelId, rss, { expirationTtl: CACHE_TTL }),
+      env.QTFM_CACHE.put('meta:' + channelId, JSON.stringify(meta), { expirationTtl: CACHE_TTL }),
       addActiveChannel(env, channelId, title, programs.length),
     ]);
   }
@@ -101,142 +124,441 @@ ${items}  </channel>
 
 async function proxyAudio(channelId, programId) {
   try {
-    const html = await fetchPage(`https://m.qtfm.cn/vchannels/${channelId}/programs/${programId}/`);
+    const html = await fetchHTML(`https://m.qtfm.cn/vchannels/${channelId}/programs/${programId}/`);
     const m = html.match(/"audioUrl"\s*:\s*"([^"]+)"/);
     if (!m) return new Response('404', { status: 404 });
     const url = m[1].replace(/\\u0026/g, '&');
-    const r = await fetch(url, { headers: { 'User-Agent': UA, 'Referer': 'https://m.qtfm.cn/' }, redirect: 'manual' });
+    const r = await fetch(url, { headers: { 'User-Agent': UA, Referer: 'https://m.qtfm.cn/' }, redirect: 'manual' });
     const text = await r.text();
     const href = text.match(/href="([^"]+)"/);
-    const loc = href ? href[1] : (r.status>=300&&r.status<400 ? r.headers.get('Location') : '');
+    const loc = href ? href[1] : (r.status >= 300 && r.status < 400 ? r.headers.get('Location') : '');
     if (!loc) return new Response('404', { status: 404 });
     return Response.redirect(loc, 302);
-  } catch(e) { return new Response('Proxy error', { status: 500 }); }
+  } catch (e) {
+    return new Response('Proxy error', { status: 500 });
+  }
 }
 
 async function addActiveChannel(env, channelId, title, programs) {
   if (!env?.QTFM_CACHE) return;
-  const raw = await env.QTFM_CACHE.get('active_channels', { type:'text' }).catch(()=>null);
+  const raw = await env.QTFM_CACHE.get('active_channels', { type: 'text' }).catch(() => null);
   const list = raw ? JSON.parse(raw) : [];
   const ex = list.find(c => c.id === channelId);
-  if (ex) { ex.lastAccess=Date.now(); ex.programs=programs; }
+  if (ex) { ex.lastAccess = Date.now(); ex.programs = programs; }
   else list.push({ id: channelId, title, programs, addedAt: Date.now() });
-  if (list.length > 100) list.splice(0, list.length-100);
-  await env.QTFM_CACHE.put('active_channels', JSON.stringify(list), { expirationTtl: 86400*30 });
+  if (list.length > 100) list.splice(0, list.length - 100);
+  await env.QTFM_CACHE.put('active_channels', JSON.stringify(list), { expirationTtl: 86400 * 30 });
 }
 
+// ── TG Bot Handler ──
+async function handleTG(env, body, base) {
+  const msg = body.message || body.callback_query?.message || {};
+  const chatId = msg.chat?.id || body.callback_query?.from?.id;
+  const text = (msg.text || '').trim();
+  if (!chatId || !text) return;
+
+  // /start
+  if (text === '/start') {
+    await tgSendHTML(chatId,
+      '🎧 蜻蜓FM播客机器人 v2\n\n' +
+      '/novel 小说名 — 搜索并抓取\n' +
+      '/status <频道ID> — 查看频道状态\n' +
+      '/update <频道ID> — 强制更新\n' +
+      '/list — 已抓取频道列表', env);
+    return;
+  }
+
+  // /status <channelId>
+  if (text.startsWith('/status') || text.startsWith('/check')) {
+    const cid = text.replace(/^\/(status|check)/, '').trim();
+    if (!cid) { await tgSendHTML(chatId, '用法: /status 频道ID', env); return; }
+
+    // 查KV
+    const rawMeta = await env?.QTFM_CACHE?.get('meta:' + cid, { type: 'text' }).catch(() => null);
+    if (rawMeta) {
+      const m = JSON.parse(rawMeta);
+      const ago = Math.round((Date.now() - (m.generatedTime || 0)) / 60000);
+      await tgSendHTML(chatId,
+        `📊 <b>${m.title}</b>\n` +
+        `ID: ${cid}\n` +
+        `集数: ${m.programs}/${m.totalExpected || '?'}\n` +
+        `状态: ${m.isComplete ? '✅ 完本' : '🔄 连载中'}\n` +
+        `缓存: ${ago}分钟前\n` +
+        `📖 ${PAGE_BASE}/${cid}.xml`, env);
+    } else {
+      // 查GH Pages
+      try {
+        const r = await fetch(`${PAGE_BASE}/${cid}.json`, { signal: AbortSignal.timeout(5000) });
+        if (r.ok) {
+          const m = await r.json();
+          await tgSendHTML(chatId,
+            `📊 <b>${m.title}</b>\n` +
+            `ID: ${cid}\n` +
+            `集数: ${m.programs}\n` +
+            `状态: ${m.isComplete ? '✅ 完本' : '🔄 连载中'}\n` +
+            `生成: ${m.generatedAt}\n` +
+            `📖 ${PAGE_BASE}/${cid}.xml`, env);
+        } else {
+          await tgSendHTML(chatId, `❌ 频道 ${cid} 未找到`, env);
+        }
+      } catch (e) {
+        await tgSendHTML(chatId, `❌ ${e.message}`, env);
+      }
+    }
+    return;
+  }
+
+  // /update <channelId>
+  if (text.startsWith('/update')) {
+    const cid = text.replace('/update', '').trim();
+    if (!cid) { await tgSendHTML(chatId, '用法: /update 频道ID', env); return; }
+
+    await tgSendHTML(chatId, `🔄 触发更新频道 ${cid}...`, env);
+    try {
+      const r = await fetch(`https://api.github.com/repos/${env.GH_REPO}/dispatches`, {
+        method: 'POST',
+        headers: {
+          'User-Agent': 'qtfm-worker',
+          Authorization: `Bearer ${env.GH_TOKEN}`,
+          Accept: 'application/vnd.github.v3+json',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          event_type: 'scrape',
+          client_payload: {
+            channel_id: cid,
+            title: '',
+            worker_base: base,
+            action_type: 'update',
+          },
+        }),
+      });
+      await tgSendHTML(chatId, r.ok || r.status === 204
+        ? `✅ 更新已触发，约5-15分钟完成\n📖 ${PAGE_BASE}/${cid}.xml`
+        : `❌ HTTP ${r.status}`, env);
+    } catch (e) {
+      await tgSendHTML(chatId, `❌ ${e.message}`, env);
+    }
+    return;
+  }
+
+  // /list
+  if (text === '/list') {
+    const raw = await env?.QTFM_CACHE?.get('active_channels', { type: 'text' }).catch(() => null);
+    if (!raw) {
+      // 从GH Pages拉
+      try {
+        const r = await fetch(`${PAGE_BASE}/index.json`, { signal: AbortSignal.timeout(5000) });
+        if (r.ok) {
+          const list = await r.json();
+          let msg = '📋 已抓取:\n';
+          for (const c of list.slice(0, 15))
+            msg += `\n<b>${c.title}</b> — ${c.programs}集 ${c.isComplete ? '✅' : '🔄'}\n${PAGE_BASE}/${c.channelId}.xml\n`;
+          if (list.length > 15) msg += `\n...还有${list.length - 15}个`;
+          await tgSendHTML(chatId, msg, env);
+        } else {
+          await tgSendHTML(chatId, '📭 暂无频道', env);
+        }
+      } catch (_) {
+        await tgSendHTML(chatId, '📭 暂无频道', env);
+      }
+      return;
+    }
+    const list = JSON.parse(raw);
+    let msg = '📋 已抓取:\n';
+    for (const c of list.slice(0, 15))
+      msg += `\n<b>${c.title}</b> — ${c.programs || '?'}集\n${base}/${c.id}\n`;
+    if (list.length > 15) msg += `\n...还有${list.length - 15}个`;
+    await tgSendHTML(chatId, msg, env);
+    return;
+  }
+
+  // /novel <小说名>
+  if (text.startsWith('/novel')) {
+    const kw = text.replace('/novel', '').trim();
+    if (!kw) { await tgSendHTML(chatId, '请输入小说名', env); return; }
+
+    await tgSendHTML(chatId, `🔍 搜索「${kw}」...`, env);
+    try {
+      const sr = await fetchJSON(`https://webapi.qtfm.cn/api/mobile/search/keyword/${encodeURIComponent(kw)}?page=1&pageSize=5`);
+      const channels = sr?.channels?.data || [];
+      if (!channels.length) { await tgSendHTML(chatId, '❌ 未找到', env); return; }
+
+      const ch = channels[0];
+      const cid = String(ch.id);
+
+      // 🌟 看缓存：是否已爬取
+      const rawMeta = await env?.QTFM_CACHE?.get('meta:' + cid, { type: 'text' }).catch(() => null);
+      if (rawMeta) {
+        const m = JSON.parse(rawMeta);
+        if (m.isComplete) {
+          // 完本：直接发链接
+          await tgSendHTML(chatId,
+            `✅ <b>${m.title}</b> (${m.programs}集) 已完本\n\n` +
+            `📖 ${PAGE_BASE}/${cid}.xml\n` +
+            `⏱ ${m.generatedAt}`, env);
+          return;
+        }
+        // 连载：看是否要更新
+        const age = Date.now() - (m.generatedTime || 0);
+        if (age < REFRESH_THRESHOLD) {
+          // 6小时内刚查过
+          await tgSendHTML(chatId,
+            `🔄 <b>${m.title}</b> 连载中 (${m.programs}集)\n` +
+            `⏱ ${Math.round(age / 60000)}分钟前检查过\n` +
+            `📖 现有订阅: ${PAGE_BASE}/${cid}.xml\n` +
+            `💡 ${age < 3600000 ? '刚查过，暂不重复触发' : '需要更新？/update ' + cid}`, env);
+          return;
+        }
+        // 超过6小时，触发更新
+        await tgSendHTML(chatId,
+          `🔄 <b>${m.title}</b> 连载中 (${m.programs}集)\n` +
+          `⏱ 上次检查: ${Math.round(age / 60000)}分钟前\n` +
+          `🚀 触发更新检查...`, env);
+      } else {
+        // 新频道
+        await tgSendHTML(chatId,
+          `📚 ${ch.title} (${ch.program_count || '?'}集)\n\n` +
+          `🚀 触发抓取...`, env);
+      }
+
+      // 触发GitHub Action
+      try {
+        const r = await fetch(`https://api.github.com/repos/${env.GH_REPO}/dispatches`, {
+          method: 'POST',
+          headers: {
+            'User-Agent': 'qtfm-worker',
+            Authorization: `Bearer ${env.GH_TOKEN}`,
+            Accept: 'application/vnd.github.v3+json',
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            event_type: 'scrape',
+            client_payload: {
+              channel_id: cid,
+              title: ch.title,
+              worker_base: base,
+              action_type: 'initial',
+            },
+          }),
+        });
+
+        if (r.ok || r.status === 204) {
+          await tgSendHTML(chatId,
+            `✅ Action已触发: ${ch.title}\n\n` +
+            `⏳ 约5-30分钟后完成\n\n` +
+            `📖 ${PAGE_BASE}/${cid}.xml`, env);
+        } else {
+          await tgSendHTML(chatId, `❌ 触发失败 HTTP ${r.status}`, env);
+        }
+      } catch (e) {
+        await tgSendHTML(chatId, `❌ ${e.message}`, env);
+      }
+    } catch (e) {
+      await tgSendHTML(chatId, `❌ ${e.message}`, env);
+    }
+    return;
+  }
+
+  // 未知命令
+  await tgSendHTML(chatId, '可用: /novel 小说名 | /status 频道ID | /update 频道ID | /list', env);
+}
+
+// ── Notification Handler (来自GitHub Action的回调) ──
+async function handleNotify(env, body) {
+  const { channelId, title, programs, isComplete, lastEpisodeId, worker_base } = body;
+  if (!channelId) return new Response('bad', { status: 400 });
+
+  const nowUTC = new Date().toUTCString();
+  const meta = {
+    channelId,
+    title: title || '未知',
+    programs: programs || 0,
+    totalExpected: body.totalExpected || programs || 0,
+    isComplete: !!isComplete,
+    lastEpisodeId: lastEpisodeId || '',
+    lastEpisodeTitle: body.lastEpisodeTitle || '',
+    lastUpdateTime: body.lastUpdateTime || nowUTC,
+    generatedAt: nowUTC,
+    generatedTime: Date.now(),
+    duration: '0s',
+  };
+
+  if (env?.QTFM_CACHE) {
+    await env.QTFM_CACHE.put('meta:' + channelId, JSON.stringify(meta), { expirationTtl: CACHE_TTL });
+    if (title) await addActiveChannel(env, channelId, title, programs);
+  }
+
+  return new Response('ok');
+}
+
+// ── Update channel list from GH Pages (called on schedule) ──
+async function syncFromGHPages(env) {
+  try {
+    const r = await fetch(`${PAGE_BASE}/state.json`, { signal: AbortSignal.timeout(10000) });
+    if (!r.ok) return;
+    const state = await r.json();
+    if (!env?.QTFM_CACHE) return;
+
+    const promises = [];
+    for (const [cid, s] of Object.entries(state)) {
+      if (!cid || !s) continue;
+      const meta = {
+        channelId: cid, title: s.title || '',
+        programs: s.totalPrograms || 0, totalExpected: s.channelTotal || 0,
+        isComplete: !!s.isComplete,
+        lastEpisodeId: s.lastEpisodeId || '',
+        lastEpisodeTitle: s.lastEpisodeTitle || '',
+        lastUpdateTime: s.lastUpdateTime || '',
+        generatedAt: s.lastCrawledAt || '',
+        generatedTime: new Date(s.lastCrawledAt || 0).getTime() || 0,
+        duration: '0s',
+      };
+      promises.push(env.QTFM_CACHE.put('meta:' + cid, JSON.stringify(meta), { expirationTtl: CACHE_TTL }));
+      promises.push(addActiveChannel(env, cid, s.title, s.totalPrograms));
+    }
+    if (promises.length) await Promise.allSettled(promises);
+  } catch (_) { }
+}
+
+// ── Request Handler ──
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const method = request.method;
-    const parts = url.pathname.replace(/^\//,'').split('/').filter(Boolean);
+    const parts = url.pathname.replace(/^\//, '').split('/').filter(Boolean);
     const base = `${url.protocol}//${url.host}`;
 
-    if (parts[0]==='webhook' && method==='POST') {
+    // TG Webhook
+    if (parts[0] === 'webhook' && method === 'POST') {
       try {
         const body = await request.json();
-        const msg = body.message || body.callback_query?.message || {};
-        const chatId = msg.chat?.id || body.callback_query?.from?.id;
-        const text = (msg.text||'').trim();
-        if (!chatId||!text) return new Response('ok');
-        if (text==='/start') {
-          await tgSendHTML(chatId, '🎧 蜻蜓FM播客机器人\n/novel 小说名 — 搜索抓取\n/list — 已抓取频道', env);
-          return new Response('ok');
-        }
-        if (text.startsWith('/novel')) {
-          const kw = text.replace('/novel','').trim();
-          if (!kw) { await tgSendHTML(chatId, '请输入小说名', env); return new Response('ok'); }
-          await tgSendHTML(chatId, `🔍 搜索「${kw}」...`, env);
-          try {
-            const sr = await fetchJSON(`https://webapi.qtfm.cn/api/mobile/search/keyword/${encodeURIComponent(kw)}?page=1&pageSize=5`);
-            const channels = sr?.channels?.data || [];
-            if (!channels.length) { await tgSendHTML(chatId, '❌ 未找到', env); return new Response('ok'); }
-            const ch = channels[0];
-            await tgSendHTML(chatId, `📚 ${ch.title} (${ch.program_count||'?'}集)\n\n🚀 触发GitHub Action抓取...`, env);
-            try {
-              const r = await fetch(`https://api.github.com/repos/${env.GH_REPO}/dispatches`, {
-                method:'POST',
-                headers:{ 'User-Agent':'qtfm-worker','Authorization':`Bearer ${env.GH_TOKEN}`,'Accept':'application/vnd.github.v3+json','Content-Type':'application/json' },
-                body: JSON.stringify({ event_type:'scrape', client_payload:{ channel_id:String(ch.id), title:ch.title, worker_base:base } })
-              });
-              await tgSendHTML(chatId, r.ok||r.status===204
-                ? `✅ Action已触发\n频道：${ch.title}\n\n⏳ 约5-30分钟后完成\n\n📖 订阅:\nhttps://general74110.github.io/qtfm-podcast/${ch.id}.xml`
-                : `❌ 失败 HTTP ${r.status}`, env);
-            } catch(e) { await tgSendHTML(chatId, `❌ ${e.message}`, env); }
-          } catch(e) { await tgSendHTML(chatId, `❌ ${e.message}`, env); }
-          return new Response('ok');
-        }
-        if (text==='/list') {
-          const raw = await env?.QTFM_CACHE?.get('active_channels', { type:'text' }).catch(()=>null);
-          if (!raw) { await tgSendHTML(chatId, '📭 暂无', env); return new Response('ok'); }
-          const list = JSON.parse(raw);
-          let msg = '📋 已抓取:\n';
-          for (const c of list.slice(0,10)) msg += `\n<b>${c.title}</b> — ${c.programs||'?'}集\n${base}/${c.id}\n`;
-          if (list.length>10) msg += `\n...还有${list.length-10}个`;
-          await tgSendHTML(chatId, msg, env);
-          return new Response('ok');
-        }
-        await tgSendHTML(chatId, '可用: /novel 小说名', env);
-        return new Response('ok');
-      } catch(e) { return new Response('ok'); }
+        await handleTG(env, body, base);
+      } catch (_) { }
+      return new Response('ok');
     }
 
-    if (!parts.length || url.pathname==='/favicon.ico')
-      return htmlResp(`<h1>🎧 蜻蜓FM → Apple播客</h1><p>用法: <code>${base}/频道ID</code></p><p>TG: /novel 小说名</p><hr><p><a href="${base}/channels">已缓存频道</a></p>`);
-
-    if (parts[0]==='yhproxy' && method==='POST') {
+    // GH Action Notification Callback
+    if (parts[0] === 'notify' && method === 'POST') {
       try {
         const body = await request.json();
-        const r = await fetch(body._url||'https://yhwsapi2.wdyynk.com/api/v1/member/login', { method:body._method||'POST', headers:{...(body._headers||{'content-type':'application/json'}), timestamp:Date.now()+'', token:body._token||''}, body:JSON.stringify(body._body||body) });
-        return new Response(await r.text(), { status:r.status, headers:{'Content-Type':r.headers.get('content-type')||'application/json','Access-Control-Allow-Origin':'*'} });
-      } catch(e) { return new Response(JSON.stringify({error:e.message}), { status:500 }); }
+        return await handleNotify(env, body);
+      } catch (e) {
+        return new Response(e.message, { status: 500 });
+      }
     }
 
-    if (parts[0]==='audio' && parts[1] && parts[2]) return await proxyAudio(parts[1], parts[2]);
-    if (method==='POST' && parts[0]==='refresh' && parts[1]) {
-      ctx.waitUntil(refreshChannel(env, parts[1], base));
+    // Homepage
+    if (!parts.length || url.pathname === '/favicon.ico')
+      return htmlResp(
+        `<h1>🎧 蜻蜓FM → Apple播客</h1>` +
+        `<p>用法: <code>${base}/频道ID</code></p>` +
+        `<p>TG: /novel 小说名</p>` +
+        `<hr>` +
+        `<p><a href="${base}/channels">已缓存频道</a></p>` +
+        `<p>GH Pages: <a href="${PAGE_BASE}">${PAGE_BASE}</a></p>`
+      );
+
+    // Audio proxy
+    if (parts[0] === 'audio' && parts[1] && parts[2])
+      return await proxyAudio(parts[1], parts[2]);
+
+    // Channels list
+    if (method === 'GET' && parts[0] === 'channels') {
+      const raw = await env?.QTFM_CACHE?.get('active_channels', { type: 'text' }).catch(() => null);
+      const list = raw ? JSON.parse(raw) : [];
+      return htmlResp(
+        `<h1>📋 已缓存频道</h1><ul>` +
+        list.map(c => `<li><a href="${base}/${c.id}">${c.title}</a> (${c.id}) — ${c.programs || 0}集</li>`).join('') +
+        `</ul>`
+      );
+    }
+
+    // Status endpoint (JSON)
+    if (method === 'GET' && parts[0] === 'status' && parts[1]) {
+      const meta = await env?.QTFM_CACHE?.get('meta:' + parts[1], { type: 'text' }).catch(() => null);
+      if (meta) return new Response(meta, { headers: { 'Content-Type': 'application/json; charset=utf-8' } });
+      return new Response('{}', { headers: { 'Content-Type': 'application/json; charset=utf-8' } });
+    }
+
+    // Refresh endpoint (async, returns immediately)
+    if (method === 'POST' && parts[0] === 'refresh' && parts[1]) {
+      ctx.waitUntil(genRSS(env, parts[1], base));
       return htmlResp(`<p>🔄 Refreshing ${parts[1]}</p>`);
     }
-    if (method==='GET' && parts[0]==='status' && parts[1]) {
-      const meta = await env?.QTFM_CACHE?.get('meta:'+parts[1], { type:'text' }).catch(()=>null);
-      return htmlResp(meta ? `<pre>${JSON.stringify(JSON.parse(meta),null,2)}</pre>` : '<p>Not cached</p>');
-    }
-    if (method==='GET' && parts[0]==='channels') {
-      const raw = await env?.QTFM_CACHE?.get('active_channels', { type:'text' }).catch(()=>null);
-      const list = raw ? JSON.parse(raw) : [];
-      return htmlResp(`<h1>📋 已缓存频道</h1><ul>${list.map(c=>`<li><a href="${base}/${c.id}">${c.title}</a> (${c.id}) — ${c.programs||0}集</li>`).join('')}</ul>`);
+
+    // Sync state from GH Pages
+    if (method === 'POST' && parts[0] === 'sync') {
+      ctx.waitUntil(syncFromGHPages(env));
+      return htmlResp(`<p>🔄 Syncing from GH Pages</p>`);
     }
 
+    // RSS proxy (频道ID)
     const channelId = parts[0];
-    if (!channelId||!/^\d+$/.test(channelId)) return textResp(`用法: ${base}/频道ID`);
-    
+    if (!channelId || !/^\d+$/.test(channelId))
+      return textResp(`用法: ${base}/频道ID`);
+
+    // 读缓存
     if (env?.QTFM_CACHE) {
-      const cached = await env.QTFM_CACHE.get('rss:'+channelId, { type:'text' }).catch(()=>null);
+      const cached = await env.QTFM_CACHE.get('rss:' + channelId, { type: 'text' }).catch(() => null);
       if (cached) {
-        const meta = await env.QTFM_CACHE.get('meta:'+channelId, { type:'text' }).catch(()=>null);
-        if (meta) { const m=JSON.parse(meta); if (Date.now()-m.generatedTime > CACHE_TTL*1000*0.5) ctx.waitUntil(refreshChannel(env, channelId, base)); }
+        // 后台刷新（不阻塞响应）
+        const meta = await env.QTFM_CACHE.get('meta:' + channelId, { type: 'text' }).catch(() => null);
+        if (meta) {
+          const m = JSON.parse(meta);
+          if (!m.isComplete && Date.now() - (m.generatedTime || 0) > REFRESH_THRESHOLD * 0.5) {
+            ctx.waitUntil(genRSS(env, channelId, base));
+          }
+        }
         return rssResp(cached);
       }
     }
+
+    // 生成
     try {
-      const rss = await refreshChannel(env, channelId, base);
+      const rss = await genRSS(env, channelId, base);
       if (rss) return rssResp(rss);
-    } catch(e) {}
-    return new Response('Generate failed', { status:503, headers:{'Retry-After':'60'} });
+    } catch (e) { }
+    return new Response('Generate failed', { status: 503, headers: { 'Retry-After': '60' } });
   },
 
+  // Scheduled cron: 刷新连载频道 + 同步GH Pages状态
   async scheduled(event, env, ctx) {
-    const raw = await env?.QTFM_CACHE?.get('active_channels', { type:'text' }).catch(()=>null);
+    // 先同步GH Pages状态
+    await syncFromGHPages(env);
+
+    // 再刷新连载频道
+    const raw = await env?.QTFM_CACHE?.get('active_channels', { type: 'text' }).catch(() => null);
     if (!raw) return;
     for (const c of JSON.parse(raw)) {
-      const meta = await env.QTFM_CACHE.get('meta:'+c.id, { type:'text' }).catch(()=>null);
-      if (meta) { const m=JSON.parse(meta); if (Date.now()-m.generatedTime < CACHE_TTL*1000*0.5) continue; }
-      await refreshChannel(env, c.id, 'https://qtfm-podcast.general74110.workers.dev');
-      await new Promise(r=>setTimeout(r,500));
+      const meta = await env.QTFM_CACHE.get('meta:' + c.id, { type: 'text' }).catch(() => null);
+      if (meta) {
+        const m = JSON.parse(meta);
+        if (m.isComplete) continue; // 完本跳过
+        if (Date.now() - (m.generatedTime || 0) < REFRESH_THRESHOLD * 0.5) continue; // 最近查过跳过
+      }
+      await genRSS(env, c.id, 'https://qtfm-podcast.general74110.workers.dev');
+      await new Promise(r => setTimeout(r, 500)); // 限速
     }
-  }
+  },
 };
 
-function rssResp(b) { return new Response(b, { headers:{'Content-Type':'application/rss+xml; charset=utf-8','Cache-Control':`public, max-age=${CACHE_TTL}`,'Access-Control-Allow-Origin':'*'} }); }
-function textResp(b) { return new Response(b, { headers:{'Content-Type':'text/plain; charset=utf-8'} }); }
-function htmlResp(b) { return new Response(`<!DOCTYPE html><html><body style="font-family:sans-serif;padding:2em;max-width:700px;margin:auto;line-height:1.6">${b}</body></html>`, { headers:{'Content-Type':'text/html; charset=utf-8'} }); }
+// ── Response Helpers ──
+function rssResp(b) {
+  return new Response(b, {
+    headers: {
+      'Content-Type': 'application/rss+xml; charset=utf-8',
+      'Cache-Control': `public, max-age=${CACHE_TTL}`,
+      'Access-Control-Allow-Origin': '*',
+    },
+  });
+}
+function textResp(b) {
+  return new Response(b, { headers: { 'Content-Type': 'text/plain; charset=utf-8' } });
+}
+function htmlResp(b) {
+  return new Response(
+    `<!DOCTYPE html><html><body style="font-family:sans-serif;padding:2em;max-width:700px;margin:auto;line-height:1.6">${b}</body></html>`,
+    { headers: { 'Content-Type': 'text/html; charset=utf-8' } }
+  );
+}
