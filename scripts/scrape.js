@@ -1,9 +1,12 @@
-// Qtfm Podcast Scraper v6 - 并行优化版
+// Qtfm Podcast Scraper v6 - 并行优化版（v5的https模块+ v6的分页逻辑）
 // 核心优化: 用API分页并行抓取代替链式顺序遍历，速度从O(n)降到O(1)
-// Node 20+ (built-in fetch)
+// 请求用原生https（v5已验证GA可跑），不用Node 20 fetch（GA环境网络层不稳定）
 
+const https = require('https');
+const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const zlib = require('zlib');
 
 const CID = process.env.CHANNEL_ID;
 if (!CID) { console.error('CHANNEL_ID required'); process.exit(1); }
@@ -11,30 +14,62 @@ if (!CID) { console.error('CHANNEL_ID required'); process.exit(1); }
 const WORKER_BASE = process.env.WORKER_BASE || 'https://qtfm-podcast.general74110.workers.dev';
 const OUT_DIR = process.env.OUT_DIR || 'novels';
 const UA = 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36';
-const FETCH_OPTS = {
-  headers: { 'User-Agent': UA, 'Accept-Encoding': 'gzip' },
-  signal: AbortSignal.timeout(20000),
-};
+
+// Keep-alive agent (复用v5已验证的配置)
+const kaAgent = new https.Agent({ keepAlive: true, maxSockets: 10, timeout: 30000 });
+const kaAgentHttp = new http.Agent({ keepAlive: true, maxSockets: 10, timeout: 30000 });
 
 // ── 工具 ──
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-async function fetchJSON(url) {
-  const r = await fetch(url, {
-    ...FETCH_OPTS,
-    headers: { ...FETCH_OPTS.headers, Accept: 'application/json', Origin: 'https://m.qtfm.cn', Referer: 'https://m.qtfm.cn/' },
+// 基于https模块的请求函数，带gzip+gzip+重试（v5已验证GA可跑）
+function httpFetch(url, { json = true, retries = 3 } = {}) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(url);
+    const mod = u.protocol === 'https:' ? https : http;
+    const agent = u.protocol === 'https:' ? kaAgent : kaAgentHttp;
+
+    function tryReq(n) {
+      const req = mod.get(u.href, {
+        agent, timeout: 30000,
+        headers: {
+          'User-Agent': UA,
+          'Accept': json ? 'application/json' : 'text/html',
+          'Accept-Encoding': 'gzip',
+          ...(json ? { 'Origin': 'https://m.qtfm.cn', 'Referer': 'https://m.qtfm.cn/' } : { 'Referer': 'https://m.qtfm.cn/' }),
+        },
+      }, (res) => {
+        const chunks = [];
+        const stream = res.headers['content-encoding'] === 'gzip'
+          ? res.pipe(zlib.createGunzip())
+          : res;
+
+        stream.on('data', c => chunks.push(c));
+        stream.on('end', () => {
+          const raw = Buffer.concat(chunks).toString('utf8');
+          if (res.statusCode >= 400) {
+            if (n > 1) return setTimeout(() => tryReq(n - 1), 2000);
+            return reject(new Error(`HTTP ${res.statusCode}`));
+          }
+          try { resolve(json ? JSON.parse(raw) : raw); }
+          catch (e) { reject(new Error(`parse: ${e.message.slice(0, 60)}`)); }
+        });
+        stream.on('error', e => { if (n > 1) setTimeout(() => tryReq(n - 1), 2000); else reject(e); });
+      });
+      req.on('error', e => { if (n > 1) setTimeout(() => tryReq(n - 1), 2000); else reject(e); });
+      req.on('timeout', () => { req.destroy(); if (n > 1) setTimeout(() => tryReq(n - 1), 2000); else reject(new Error('timeout')); });
+      req.end();
+    }
+    tryReq(retries);
   });
-  if (!r.ok) throw new Error(`HTTP ${r.status} ${r.statusText}`);
-  return r.json();
+}
+
+async function fetchJSON(url) {
+  return httpFetch(url, { json: true });
 }
 
 async function fetchHTML(url) {
-  const r = await fetch(url, {
-    ...FETCH_OPTS,
-    headers: { ...FETCH_OPTS.headers, Accept: 'text/html', Referer: 'https://m.qtfm.cn/' },
-  });
-  if (!r.ok) throw new Error(`HTTP ${r.status} ${r.statusText}`);
-  return r.text();
+  return httpFetch(url, { json: false });
 }
 
 function extractInitStores(html) {
@@ -84,33 +119,46 @@ async function fetchChannelMeta() {
 
 // ── 2a. API分页并行抓取（优先） ──
 async function fetchProgramsByAPI(ver) {
-  const CHUNK = 200; // 每页大小
+  const CHUNK = 200;
   const first = await fetchJSON(`https://webapi.qtfm.cn/api/mobile/channels/${CID}/programs?version=${ver}&page=1&pageSize=${CHUNK}`);
   const firstBatch = first?.programs || [];
   const total = first?.total || firstBatch.length;
 
-  // 如果没total字段，或者首页就拿到了全部，直接返回
+  // 检测API是否支持分页
+  // 如果没total字段，或者一页拿全了，直接返回
   if (!first?.total || firstBatch.length >= total) {
     console.log(`[api] Single batch: ${firstBatch.length} programs`);
     return firstBatch;
   }
 
+  // 检查分页是否生效：取第2页，如果programId和第1页一样，说明分页无效
+  const page2 = await fetchJSON(`https://webapi.qtfm.cn/api/mobile/channels/${CID}/programs?version=${ver}&page=2&pageSize=${CHUNK}`);
+  const p2Programs = page2?.programs || [];
+  if (p2Programs.length && p2Programs[0]?.programId === firstBatch[0]?.programId) {
+    console.log(`[api] Pagination NOT supported (same data), using single batch: ${firstBatch.length}`);
+    return firstBatch;
+  }
+  if (!p2Programs.length) {
+    console.log(`[api] Page 2 empty, no pagination. Batch: ${firstBatch.length}`);
+    return firstBatch;
+  }
+
+  // 分页生效，并行抓取剩余页面
   const totalPages = Math.ceil(total / CHUNK);
   console.log(`[api] Paginated: total=${total}, pages=${totalPages}, chunk=${CHUNK}`);
 
-  // 并行抓取剩余页面
-  const remaining = totalPages - 1;
-  if (remaining <= 0) return firstBatch;
+  const remaining = totalPages - 2; // already have p1 and p2
+  if (remaining <= 0) return [...firstBatch, ...p2Programs];
 
   const pages = await Promise.allSettled(
     Array.from({ length: remaining }, (_, i) =>
-      fetchJSON(`https://webapi.qtfm.cn/api/mobile/channels/${CID}/programs?version=${ver}&page=${i + 2}&pageSize=${CHUNK}`)
+      fetchJSON(`https://webapi.qtfm.cn/api/mobile/channels/${CID}/programs?version=${ver}&page=${i + 3}&pageSize=${CHUNK}`)
         .then(r => r?.programs || [])
-        .catch(e => { console.error(`[api] Page ${i + 2} failed: ${e.message}`); return []; })
+        .catch(e => { console.error(`[api] Page ${i + 3} failed: ${e.message}`); return []; })
     )
   );
 
-  const all = [firstBatch, ...pages.map(p => p.status === 'fulfilled' ? p.value : [])].flat();
+  const all = [firstBatch, p2Programs, ...pages.map(p => p.status === 'fulfilled' ? p.value : [])].flat();
   console.log(`[api] Total via pagination: ${all.length}`);
   return all;
 }
@@ -129,12 +177,11 @@ async function fetchProgramsChain(seedBatch) {
 
   while (cur && walked < MAX_WALK) {
     try {
-      const html = await fetchHTML(`https://m.qtfm.cn/vchannels/${CID}/programs/${cur}/`);
-      const d = extractInitStores(html);
-      if (!d?.ProgramStore?.programInfo) { errs++; if (errs > 3) break; cur = null; break; }
+      // 🌟 用JSON API代替HTML页面，快3-5倍
+      const pi = (await fetchJSON(`https://webapi.qtfm.cn/api/mobile/channels/${CID}/programs/${cur}`)).programInfo;
+      if (!pi?.nextProgramId) { break; }
       errs = 0;
 
-      const pi = d.ProgramStore.programInfo;
       const nid = pi.nextProgramId;
       if (!nid || seen.has(nid)) break;
 
@@ -143,19 +190,20 @@ async function fetchProgramsChain(seedBatch) {
         programId: nid,
         title: pi.title || '',
         duration: pi.duration || 0,
-        updateTime: pi.updateTime || all[0]?.updateTime || '2022-01-01T00:00:00.000Z',
+        // updateTime不在JSON里时用seedBatch的时间
+        updateTime: pi.updateTime || pi.createdAt || all[0]?.updateTime || new Date().toISOString(),
       });
       cur = nid;
       walked++;
-      if (walked % 50 === 0) console.log(`[chain] walked ${walked}, total ${all.length}`);
+      if (walked % 100 === 0) console.log(`[chain] ${walked}/${MAX_WALK} items, ${Math.round(Date.now()/1000)}s`);
     } catch (e) {
-      console.error(`[chain] err @ ${walked}: ${e.message.slice(0, 60)}`);
+      console.error(`[chain] err @ ${walked}: ${(e.message||e).slice(0, 60)}`);
       errs++;
       if (errs > 3) break;
       cur = null;
     }
   }
-  console.log(`[chain] walked ${walked}, total ${all.length}`);
+  console.log(`[chain] done: walked ${walked}, total ${all.length}`);
   return all;
 }
 
